@@ -29,6 +29,8 @@ pub struct AudioBuffer {
     recording_start_time: Arc<Mutex<Option<Instant>>>,
     /// トグルモード用蓄積バッファ
     accumulated_samples: Arc<Mutex<Vec<f32>>>,
+    /// トグルモードの無音時間しきい値（秒）
+    toggle_silence_threshold_sec: u32,
 }
 
 impl AudioBuffer {
@@ -41,6 +43,7 @@ impl AudioBuffer {
             tx,
             recording_start_time: Arc::new(Mutex::new(None)),
             accumulated_samples: Arc::new(Mutex::new(Vec::new())),
+            toggle_silence_threshold_sec: 10, // トグルモードで10秒無音で自動停止
         }
     }
 
@@ -181,9 +184,55 @@ impl AudioBuffer {
                 self.start_recording()?;
             }
         } else if let RecordingMode::Toggle { .. } = &config.recording_mode {
-            // トグルモードでは無音検出しても録音を継続
-            if is_recording && significant_voice {
-                debug!("トグルモード: 有効な音声を検出しました");
+            // トグルモードでの無音検出と処理
+            if is_recording {
+                if let Some(last_time) = *last_activity {
+                    let silence_duration = Instant::now().duration_since(last_time);
+                    
+                    // トグルモードでも一定時間以上無音が続いたら自動的に録音を停止
+                    if silence_duration > Duration::from_secs(self.toggle_silence_threshold_sec as u64) {
+                        // 蓄積バッファの確認
+                        let accumulated = self.accumulated_samples.lock().map_err(|_| anyhow!("蓄積バッファロックエラー"))?;
+                        
+                        // 蓄積バッファにデータがある場合のみ処理
+                        if !accumulated.is_empty() {
+                            debug!("トグルモード: {}秒間無音が続いたため録音を自動停止します", self.toggle_silence_threshold_sec);
+                            
+                            // 蓄積バッファをクローンしてロックを解放
+                            let samples_to_send = accumulated.clone();
+                            
+                            // 録音状態のフラグを直接操作せず、stop_recording経由で処理
+                            if is_recording {
+                                // 録音状態を停止
+                                info!("録音を停止します（無音自動停止）");
+                                let _ = show_notification("音声入力", "録音を停止しました（無音自動停止）");
+                                
+                                // フラグを直接更新
+                                self.is_recording.store(false, Ordering::SeqCst);
+                                *recording_start = None;
+                                
+                                // 蓄積バッファのデータを送信
+                                debug!("トグルモード: 蓄積バッファからサンプル送信 ({} サンプル)", samples_to_send.len());
+                                let tx = self.tx.clone();
+                                let _ = tx.try_send(samples_to_send);
+                                
+                                // バッファをクリア（次の録音のため）
+                                let mut accumulated = self.accumulated_samples.lock().map_err(|_| anyhow!("蓄積バッファロックエラー"))?;
+                                accumulated.clear();
+                            }
+                        } else {
+                            // 蓄積バッファが空の場合は単に録音状態を停止
+                            info!("録音を停止します（無音自動停止・データなし）");
+                            let _ = show_notification("音声入力", "録音を停止しました（無音自動停止）");
+                            self.is_recording.store(false, Ordering::SeqCst);
+                            *recording_start = None;
+                        }
+                    }
+                }
+                
+                if significant_voice {
+                    debug!("トグルモード: 有効な音声を検出しました");
+                }
             }
         }
         
@@ -238,6 +287,11 @@ impl AudioBuffer {
                 let samples = accumulated.clone();
                 // 送信エラーは無視（受信側が閉じている場合）
                 let _ = tx.try_send(samples);
+                
+                // バッファをクリア (追加)
+                drop(accumulated); // 現在のロックを解放
+                let mut accumulated_mut = self.accumulated_samples.lock().map_err(|_| anyhow!("蓄積バッファロックエラー"))?;
+                accumulated_mut.clear();
             } else {
                 // 蓄積バッファが空の場合は通常バッファから送信
                 let buffer = self.buffer.lock().map_err(|_| anyhow!("バッファロックエラー"))?;
