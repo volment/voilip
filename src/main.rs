@@ -32,21 +32,25 @@ struct Cli {
 enum Command {
     /// 音声認識を開始
     Start {
-        /// 出力モード: clipboard, type, both
-        #[arg(short, long, default_value = "clipboard")]
-        mode: String,
+        /// 出力モード: clipboard
+        #[arg(short, long)]
+        mode: Option<String>,
         
         /// 言語コード (例: ja, en)
-        #[arg(short, long, default_value = "ja")]
-        lang: String,
+        #[arg(short, long)]
+        lang: Option<String>,
         
         /// Push-To-Talkキー
         #[arg(long)]
         ptt: Option<String>,
         
+        /// トグルキー (例: F9, Ctrl+F10)
+        #[arg(long)]
+        toggle: Option<String>,
+        
         /// 音声エンジン: gpt-4o, whisper-1, whisper-cpp
-        #[arg(long, default_value = "gpt-4o")]
-        engine: String,
+        #[arg(long)]
+        engine: Option<String>,
         
         /// Whisper.cppのパス (whisper-cppエンジン使用時)
         #[arg(long)]
@@ -55,6 +59,10 @@ enum Command {
         /// Whisper.cppのモデルパス (whisper-cppエンジン使用時)
         #[arg(long)]
         whisper_cpp_model: Option<PathBuf>,
+        
+        /// 使用するモデル (例: gpt-4o-transcribe)
+        #[arg(long)]
+        model: Option<String>,
     },
     
     /// テストモード (音声ファイルから文字起こし)
@@ -64,8 +72,63 @@ enum Command {
         test_file: PathBuf,
         
         /// 使用するモデル
-        #[arg(long, default_value = "gpt-4o")]
+        #[arg(long)]
+        model: Option<String>,
+    },
+    
+    /// 設定の管理
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// 現在の設定を表示
+    Show,
+    
+    /// APIキーを設定
+    SetApiKey {
+        /// OpenAI API キー
+        api_key: String,
+    },
+    
+    /// トグルキーを設定 (例: F9, Ctrl+F10)
+    SetToggleKey {
+        /// キー名
+        key: String,
+    },
+    
+    /// Push-To-Talkキーを設定
+    SetPttKey {
+        /// キー名
+        key: String,
+    },
+    
+    /// 言語を設定
+    SetLanguage {
+        /// 言語コード (例: ja, en)
+        lang: String,
+    },
+    
+    /// モデルを設定
+    SetModel {
+        /// モデル名 (例: gpt-4o-transcribe)
         model: String,
+    },
+    
+    /// 無音除去を設定
+    SetRemoveSilence {
+        /// 有効/無効
+        #[arg(default_value = "true")]
+        enable: bool,
+    },
+    
+    /// 再生速度を設定
+    SetSpeedFactor {
+        /// 速度倍率 (例: 1.0, 1.1, 1.5)
+        factor: f32,
     },
 }
 
@@ -91,18 +154,22 @@ async fn main() -> Result<()> {
             mode, 
             lang, 
             ptt, 
+            toggle,
             engine, 
             whisper_cpp_path, 
-            whisper_cpp_model 
+            whisper_cpp_model,
+            model,
         } => {
             // 設定の読み込み
             let mut config = Config::new(
-                &mode,
-                &lang,
+                mode.as_deref(),
+                lang.as_deref(),
                 ptt.as_deref(),
-                &engine,
+                engine.as_deref(),
                 whisper_cpp_path.as_ref(),
                 whisper_cpp_model.as_ref(),
+                toggle.as_deref(),
+                model.as_deref(),
             )?;
             
             // トグルモードの場合、録音の最大持続時間を長く設定
@@ -110,7 +177,14 @@ async fn main() -> Result<()> {
                 config.max_recording_duration_sec = Some(300); // 5分
             }
             
-            info!("音声認識を開始します: モード={}, 言語={}, エンジン={}", mode, lang, engine);
+            info!("音声認識を開始します: 言語={}, エンジン={}, モデル={}", 
+                config.language, 
+                match config.transcription_engine {
+                    config::TranscriptionEngine::GPT4o => "GPT-4o",
+                    config::TranscriptionEngine::Whisper1 => "Whisper-1",
+                    config::TranscriptionEngine::WhisperCpp { .. } => "Whisper.cpp",
+                },
+                config.model);
             
             // チャネルの設定
             let (audio_tx, audio_rx) = mpsc::channel::<Vec<f32>>(32);
@@ -173,10 +247,14 @@ async fn main() -> Result<()> {
             Ok(())
         },
         Command::Test { test_file, model } => {
-            info!("テストモード: ファイル={}, モデル={}", test_file.display(), model);
+            info!("テストモード: ファイル={}", test_file.display());
             
-            // デフォルト設定
-            let config = Config::default();
+            // 設定ファイルから読み込み
+            let config = Config::load().unwrap_or_default();
+            
+            // モデルはコマンドラインで指定されたものを優先
+            let model_name = model.unwrap_or(config.model.clone());
+            info!("使用モデル: {}", model_name);
             
             // チャネルの設定 (ダミー)
             let (_audio_tx, audio_rx) = mpsc::channel::<Vec<f32>>(1);
@@ -186,7 +264,7 @@ async fn main() -> Result<()> {
             let transcriber = Transcriber::new(config, audio_rx, result_tx);
             
             // テスト実行
-            match transcriber.transcribe_file(&test_file, &model).await {
+            match transcriber.transcribe_file(&test_file, &model_name).await {
                 Ok(result) => {
                     info!("文字起こし結果:");
                     info!("言語: {}", result.language);
@@ -198,6 +276,57 @@ async fn main() -> Result<()> {
                     error!("文字起こしエラー: {}", e);
                     Err(e)
                 }
+            }
+        },
+        Command::Config { action } => {
+            match action {
+                ConfigAction::Show => {
+                    let config = Config::load()?;
+                    println!("{}", config.display());
+                    Ok(())
+                },
+                ConfigAction::SetApiKey { api_key } => {
+                    let mut config = Config::load()?;
+                    config.set_api_key(&api_key)?;
+                    println!("APIキーを設定しました");
+                    Ok(())
+                },
+                ConfigAction::SetToggleKey { key } => {
+                    let mut config = Config::load()?;
+                    config.set_toggle_key(&key)?;
+                    println!("トグルキーを設定しました: {}", key);
+                    Ok(())
+                },
+                ConfigAction::SetPttKey { key } => {
+                    let mut config = Config::load()?;
+                    config.set_ptt_key(&key)?;
+                    println!("PTTキーを設定しました: {}", key);
+                    Ok(())
+                },
+                ConfigAction::SetLanguage { lang } => {
+                    let mut config = Config::load()?;
+                    config.set_language(&lang)?;
+                    println!("言語を設定しました: {}", lang);
+                    Ok(())
+                },
+                ConfigAction::SetModel { model } => {
+                    let mut config = Config::load()?;
+                    config.set_model(&model)?;
+                    println!("モデルを設定しました: {}", model);
+                    Ok(())
+                },
+                ConfigAction::SetRemoveSilence { enable } => {
+                    let mut config = Config::load()?;
+                    config.set_remove_silence(enable)?;
+                    println!("無音除去を{}に設定しました", if enable { "有効" } else { "無効" });
+                    Ok(())
+                },
+                ConfigAction::SetSpeedFactor { factor } => {
+                    let mut config = Config::load()?;
+                    config.set_speed_factor(factor)?;
+                    println!("再生速度を{:.1}倍に設定しました", factor);
+                    Ok(())
+                },
             }
         },
     }

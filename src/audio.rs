@@ -518,23 +518,80 @@ impl AudioCapture {
             let ptt_key = parse_key_name(key);
             let audio_buffer = self.audio_buffer.clone();
             
+            // 複合キーの処理用
+            let is_composite = key.contains("+");
+            let modifier_key = if is_composite {
+                let parts: Vec<&str> = key.split("+").collect();
+                let modifier = parts[0].trim().to_uppercase();
+                match modifier.as_str() {
+                    "CTRL" => Some(Key::ControlLeft),
+                    "ALT" => Some(Key::Alt),
+                    "SHIFT" => Some(Key::ShiftLeft),
+                    "META" | "SUPER" => Some(Key::Unknown(0xE05B)),
+                    _ => None
+                }
+            } else {
+                None
+            };
+            
+            // 修飾キーの状態を追跡
+            let modifier_pressed = Arc::new(AtomicBool::new(false));
+            
             // キー入力監視スレッドを作成
             let handle = thread::spawn(move || {
                 let callback = move |event: Event| {
                     match event.event_type {
                         EventType::KeyPress(key_event) => {
+                            // 修飾キーの状態を更新
+                            if let Some(mod_key) = modifier_key {
+                                if key_event == mod_key {
+                                    modifier_pressed.store(true, Ordering::SeqCst);
+                                }
+                            }
+                            
+                            // PTTキーの処理
                             if key_event == ptt_key {
-                                debug!("PTTキー押下: {:?}", key_event);
-                                if let Err(e) = audio_buffer.start_recording() {
-                                    error!("録音開始エラー: {}", e);
+                                // 複合キーの場合は修飾キーが押されていることを確認
+                                let should_activate = if is_composite {
+                                    modifier_pressed.load(Ordering::SeqCst)
+                                } else {
+                                    true
+                                };
+                                
+                                if should_activate {
+                                    debug!("PTTキー押下: {}{:?}", 
+                                        if is_composite { format!("{:?}+", modifier_key.unwrap()) } else { "".to_string() }, 
+                                        key_event);
+                                    if let Err(e) = audio_buffer.start_recording() {
+                                        error!("録音開始エラー: {}", e);
+                                    }
                                 }
                             }
                         }
                         EventType::KeyRelease(key_event) => {
+                            // 修飾キーのリリース
+                            if let Some(mod_key) = modifier_key {
+                                if key_event == mod_key {
+                                    modifier_pressed.store(false, Ordering::SeqCst);
+                                    
+                                    // 修飾キーが離されたら録音を停止（複合キーの場合）
+                                    if is_composite && audio_buffer.is_recording() {
+                                        debug!("修飾キーリリースでPTT停止");
+                                        if let Err(e) = audio_buffer.stop_recording() {
+                                            error!("録音停止エラー: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // メインキーのリリース
                             if key_event == ptt_key {
-                                debug!("PTTキー解放: {:?}", key_event);
-                                if let Err(e) = audio_buffer.stop_recording() {
-                                    error!("録音停止エラー: {}", e);
+                                // 複合キーでない場合、またはPTTがリリースされた場合に停止
+                                if !is_composite || !modifier_pressed.load(Ordering::SeqCst) {
+                                    debug!("PTTキー解放: {:?}", key_event);
+                                    if let Err(e) = audio_buffer.stop_recording() {
+                                        error!("録音停止エラー: {}", e);
+                                    }
                                 }
                             }
                         }
@@ -562,23 +619,70 @@ impl AudioCapture {
             let toggle_key = parse_key_name(key);
             let audio_buffer = self.audio_buffer.clone();
             
+            // 複合キーの処理用
+            let is_composite = key.contains("+");
+            let modifier_key = if is_composite {
+                let parts: Vec<&str> = key.split("+").collect();
+                let modifier = parts[0].trim().to_uppercase();
+                match modifier.as_str() {
+                    "CTRL" => Some(Key::ControlLeft),
+                    "ALT" => Some(Key::Alt),
+                    "SHIFT" => Some(Key::ShiftLeft),
+                    "META" | "SUPER" => Some(Key::Unknown(0xE05B)),
+                    _ => None
+                }
+            } else {
+                None
+            };
+            
+            // 修飾キーの状態を追跡
+            let modifier_pressed = Arc::new(AtomicBool::new(false));
+            let modifier_pressed_clone = modifier_pressed.clone();
+            
             // キー入力監視スレッドを作成
             let handle = thread::spawn(move || {
                 let callback = move |event: Event| {
                     match event.event_type {
                         EventType::KeyPress(key_event) => {
+                            // 修飾キーの状態を更新
+                            if let Some(mod_key) = modifier_key {
+                                if key_event == mod_key {
+                                    modifier_pressed.store(true, Ordering::SeqCst);
+                                }
+                            }
+                            
+                            // トグルキーの処理
                             if key_event == toggle_key {
-                                debug!("トグルキー押下: {:?}", key_event);
-                                
-                                // 状態をトグル
-                                if audio_buffer.is_recording() {
-                                    if let Err(e) = audio_buffer.stop_recording() {
-                                        error!("録音停止エラー: {}", e);
-                                    }
+                                // 複合キーの場合は修飾キーが押されていることを確認
+                                let should_toggle = if is_composite {
+                                    modifier_pressed.load(Ordering::SeqCst)
                                 } else {
-                                    if let Err(e) = audio_buffer.start_recording() {
-                                        error!("録音開始エラー: {}", e);
+                                    true
+                                };
+                                
+                                if should_toggle {
+                                    debug!("トグルキー押下: {}{:?}", 
+                                        if is_composite { format!("{:?}+", modifier_key.unwrap()) } else { "".to_string() }, 
+                                        key_event);
+                                    
+                                    // 状態をトグル
+                                    if audio_buffer.is_recording() {
+                                        if let Err(e) = audio_buffer.stop_recording() {
+                                            error!("録音停止エラー: {}", e);
+                                        }
+                                    } else {
+                                        if let Err(e) = audio_buffer.start_recording() {
+                                            error!("録音開始エラー: {}", e);
+                                        }
                                     }
+                                }
+                            }
+                        }
+                        EventType::KeyRelease(key_event) => {
+                            // 修飾キーのリリース
+                            if let Some(mod_key) = modifier_key {
+                                if key_event == mod_key {
+                                    modifier_pressed.store(false, Ordering::SeqCst);
                                 }
                             }
                         }
@@ -629,33 +733,170 @@ impl Drop for AudioCapture {
 
 /// キー名をrdevのKeyに変換
 fn parse_key_name(key_name: &str) -> Key {
-    match key_name.to_uppercase().as_str() {
-        "F1" => Key::F1,
-        "F2" => Key::F2,
-        "F3" => Key::F3,
-        "F4" => Key::F4,
-        "F5" => Key::F5,
-        "F6" => Key::F6,
-        "F7" => Key::F7,
-        "F8" => Key::F8,
-        "F9" => Key::F9,
-        "F10" => Key::F10,
-        "F11" => Key::F11,
-        "F12" => Key::F12,
-        "SHIFT" | "LSHIFT" => Key::ShiftLeft,
-        "RSHIFT" => Key::ShiftRight,
-        "CTRL" | "LCTRL" => Key::ControlLeft,
-        "RCTRL" => Key::ControlRight,
-        "ALT" | "LALT" => Key::Alt,
-        "RALT" => Key::Alt,
-        "META" | "SUPER" | "LMETA" | "LSUPER" => Key::Unknown(0xE05B), // Windows/Super key
-        "RMETA" | "RSUPER" => Key::Unknown(0xE05C), // Right Windows/Super key
-        "SPACE" => Key::Space,
-        "TAB" => Key::Tab,
-        "ESCAPE" | "ESC" => Key::Escape,
-        _ => {
-            warn!("未対応のキー名: {}、CapsLockにフォールバック", key_name);
-            Key::CapsLock
+    // 複合キーの場合は単一キーとして扱う
+    if key_name.contains("+") {
+        let parts: Vec<&str> = key_name.split("+").collect();
+        let modifier = parts[0].trim().to_uppercase();
+        let key = parts[1].trim();
+        
+        // 主要なキーを解析
+        // 小文字であれば英字キーとして処理
+        if key.len() == 1 {
+            let c = key.chars().next().unwrap();
+            if c.is_ascii_alphabetic() {
+                // アルファベットキー
+                return match c {
+                    'a' | 'A' => Key::KeyA,
+                    'b' | 'B' => Key::KeyB,
+                    'c' | 'C' => Key::KeyC,
+                    'd' | 'D' => Key::KeyD,
+                    'e' | 'E' => Key::KeyE,
+                    'f' | 'F' => Key::KeyF,
+                    'g' | 'G' => Key::KeyG,
+                    'h' | 'H' => Key::KeyH,
+                    'i' | 'I' => Key::KeyI,
+                    'j' | 'J' => Key::KeyJ,
+                    'k' | 'K' => Key::KeyK,
+                    'l' | 'L' => Key::KeyL,
+                    'm' | 'M' => Key::KeyM,
+                    'n' | 'N' => Key::KeyN,
+                    'o' | 'O' => Key::KeyO,
+                    'p' | 'P' => Key::KeyP,
+                    'q' | 'Q' => Key::KeyQ,
+                    'r' | 'R' => Key::KeyR,
+                    's' | 'S' => Key::KeyS,
+                    't' | 'T' => Key::KeyT,
+                    'u' | 'U' => Key::KeyU,
+                    'v' | 'V' => Key::KeyV,
+                    'w' | 'W' => Key::KeyW,
+                    'x' | 'X' => Key::KeyX,
+                    'y' | 'Y' => Key::KeyY,
+                    'z' | 'Z' => Key::KeyZ,
+                    _ => {
+                        warn!("未対応の文字キー: {}, F9にフォールバック", c);
+                        Key::F9
+                    }
+                };
+            } else if c.is_ascii_digit() {
+                // 数字キー
+                return match c {
+                    '0' => Key::Num0,
+                    '1' => Key::Num1,
+                    '2' => Key::Num2,
+                    '3' => Key::Num3,
+                    '4' => Key::Num4,
+                    '5' => Key::Num5,
+                    '6' => Key::Num6,
+                    '7' => Key::Num7,
+                    '8' => Key::Num8,
+                    '9' => Key::Num9,
+                    _ => Key::F9  // ここには来ないはず
+                };
+            }
+        }
+        
+        // ファンクションキーや特殊キー
+        match key.to_uppercase().as_str() {
+            "F1" => Key::F1,
+            "F2" => Key::F2,
+            "F3" => Key::F3,
+            "F4" => Key::F4,
+            "F5" => Key::F5,
+            "F6" => Key::F6,
+            "F7" => Key::F7,
+            "F8" => Key::F8,
+            "F9" => Key::F9,
+            "F10" => Key::F10,
+            "F11" => Key::F11,
+            "F12" => Key::F12,
+            "SPACE" => Key::Space,
+            "TAB" => Key::Tab,
+            "ESCAPE" | "ESC" => Key::Escape,
+            _ => {
+                warn!("未対応のキー名: {}、F9にフォールバック", key);
+                Key::F9
+            }
+        }
+    } else {
+        // 単一キーの場合
+        // アルファベットキーの処理を追加
+        if key_name.len() == 1 {
+            let c = key_name.chars().next().unwrap();
+            if c.is_ascii_alphabetic() {
+                return match c {
+                    'a' | 'A' => Key::KeyA,
+                    'b' | 'B' => Key::KeyB,
+                    'c' | 'C' => Key::KeyC,
+                    'd' | 'D' => Key::KeyD,
+                    'e' | 'E' => Key::KeyE,
+                    'f' | 'F' => Key::KeyF,
+                    'g' | 'G' => Key::KeyG,
+                    'h' | 'H' => Key::KeyH,
+                    'i' | 'I' => Key::KeyI,
+                    'j' | 'J' => Key::KeyJ,
+                    'k' | 'K' => Key::KeyK,
+                    'l' | 'L' => Key::KeyL,
+                    'm' | 'M' => Key::KeyM,
+                    'n' | 'N' => Key::KeyN,
+                    'o' | 'O' => Key::KeyO,
+                    'p' | 'P' => Key::KeyP,
+                    'q' | 'Q' => Key::KeyQ,
+                    'r' | 'R' => Key::KeyR,
+                    's' | 'S' => Key::KeyS,
+                    't' | 'T' => Key::KeyT,
+                    'u' | 'U' => Key::KeyU,
+                    'v' | 'V' => Key::KeyV,
+                    'w' | 'W' => Key::KeyW,
+                    'x' | 'X' => Key::KeyX,
+                    'y' | 'Y' => Key::KeyY,
+                    'z' | 'Z' => Key::KeyZ,
+                    _ => Key::CapsLock
+                };
+            } else if c.is_ascii_digit() {
+                return match c {
+                    '0' => Key::Num0,
+                    '1' => Key::Num1,
+                    '2' => Key::Num2,
+                    '3' => Key::Num3,
+                    '4' => Key::Num4,
+                    '5' => Key::Num5,
+                    '6' => Key::Num6,
+                    '7' => Key::Num7,
+                    '8' => Key::Num8,
+                    '9' => Key::Num9,
+                    _ => Key::CapsLock  // ここには来ないはず
+                };
+            }
+        }
+
+        match key_name.to_uppercase().as_str() {
+            "F1" => Key::F1,
+            "F2" => Key::F2,
+            "F3" => Key::F3,
+            "F4" => Key::F4,
+            "F5" => Key::F5,
+            "F6" => Key::F6,
+            "F7" => Key::F7,
+            "F8" => Key::F8,
+            "F9" => Key::F9,
+            "F10" => Key::F10,
+            "F11" => Key::F11,
+            "F12" => Key::F12,
+            "SHIFT" | "LSHIFT" => Key::ShiftLeft,
+            "RSHIFT" => Key::ShiftRight,
+            "CTRL" | "LCTRL" => Key::ControlLeft,
+            "RCTRL" => Key::ControlRight,
+            "ALT" | "LALT" => Key::Alt,
+            "RALT" => Key::Alt,
+            "META" | "SUPER" | "LMETA" | "LSUPER" => Key::Unknown(0xE05B), // Windows/Super key
+            "RMETA" | "RSUPER" => Key::Unknown(0xE05C), // Right Windows/Super key
+            "SPACE" => Key::Space,
+            "TAB" => Key::Tab,
+            "ESCAPE" | "ESC" => Key::Escape,
+            _ => {
+                warn!("未対応のキー名: {}、CapsLockにフォールバック", key_name);
+                Key::CapsLock
+            }
         }
     }
 }

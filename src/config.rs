@@ -2,18 +2,17 @@ use std::path::PathBuf;
 use std::env;
 use std::str::FromStr;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{info, warn, debug};
 use anyhow::{Result, anyhow};
+use std::fs;
+use std::io::Write;
+use directories::ProjectDirs;
 
 /// 出力モード
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum OutputMode {
     /// クリップボードにコピー
     Clipboard,
-    /// アクティブウィンドウに入力
-    Type,
-    /// 両方
-    Both,
 }
 
 impl FromStr for OutputMode {
@@ -22,8 +21,6 @@ impl FromStr for OutputMode {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "clipboard" => Ok(OutputMode::Clipboard),
-            "type" => Ok(OutputMode::Type),
-            "both" => Ok(OutputMode::Both),
             _ => Err(format!("不明な出力モード: {}", s)),
         }
     }
@@ -48,11 +45,9 @@ impl FromStr for TranscriptionEngine {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "gpt-4o" => Ok(TranscriptionEngine::GPT4o),
+            "gpt-4o" | "gpt-4o-transcribe" => Ok(TranscriptionEngine::GPT4o),
             "whisper-1" => Ok(TranscriptionEngine::Whisper1),
             "whisper.cpp" | "whisper-cpp" => {
-                // 注: このパターンでFromStrを使用する場合は、パスを別途設定する必要があります
-                // 実際の使用時はfrom_strではなく直接コンストラクタを使用します
                 Err("Whisper.cppには追加のパラメータが必要です".to_string())
             }
             _ => Err(format!("不明な音声認識エンジン: {}", s)),
@@ -89,12 +84,18 @@ pub struct Config {
     pub sample_rate: u32,
     pub channels: u16,
     pub max_recording_duration_sec: Option<u32>,
+    pub remove_silence: bool,
+    pub speed_factor: f32,
+    pub model: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
+        // APIキーは環境変数からも読み取れるようにしておく（後方互換性）
+        let api_key = env::var("OPENAI_API_KEY").unwrap_or_default();
+        
         Self {
-            openai_api_key: env::var("OPENAI_API_KEY").unwrap_or_default(),
+            openai_api_key: api_key,
             output_mode: OutputMode::Clipboard,
             language: "ja".to_string(),
             transcription_engine: TranscriptionEngine::GPT4o,
@@ -105,75 +106,242 @@ impl Default for Config {
             sample_rate: 16000,
             channels: 1,
             max_recording_duration_sec: Some(60),
+            remove_silence: true,
+            speed_factor: 1.1,
+            model: "gpt-4o-transcribe".to_string(),
         }
     }
 }
 
 impl Config {
-    /// 環境変数と引数から設定を作成
+    /// 設定ファイルのパスを取得
+    pub fn get_config_path() -> Result<PathBuf> {
+        if let Some(proj_dirs) = ProjectDirs::from("com", "volment", "voilip") {
+            let config_dir = proj_dirs.config_dir();
+            fs::create_dir_all(config_dir)?;
+            Ok(config_dir.join("config.json"))
+        } else {
+            Err(anyhow!("設定ディレクトリを特定できません"))
+        }
+    }
+    
+    /// 設定ファイルから読み込み
+    pub fn load() -> Result<Self> {
+        let config_path = Self::get_config_path()?;
+        
+        if config_path.exists() {
+            let config_str = fs::read_to_string(&config_path)?;
+            let config: Config = serde_json::from_str(&config_str)?;
+            info!("設定ファイルを読み込みました: {:?}", config_path);
+            Ok(config)
+        } else {
+            // 設定ファイルがない場合はデフォルト設定を使用
+            let config = Config::default();
+            info!("設定ファイルが見つからないため、デフォルト設定を使用します");
+            Ok(config)
+        }
+    }
+    
+    /// 設定ファイルに保存
+    pub fn save(&self) -> Result<()> {
+        let config_path = Self::get_config_path()?;
+        let config_str = serde_json::to_string_pretty(self)?;
+        
+        let mut file = fs::File::create(&config_path)?;
+        file.write_all(config_str.as_bytes())?;
+        
+        info!("設定を保存しました: {:?}", config_path);
+        Ok(())
+    }
+    
+    /// 設定を表示
+    pub fn display(&self) -> String {
+        let mut output = String::new();
+        output.push_str("【現在の設定】\n");
+        output.push_str(&format!("APIキー: {}\n", if self.openai_api_key.is_empty() { "未設定" } else { "設定済み" }));
+        output.push_str(&format!("出力モード: {:?}\n", self.output_mode));
+        output.push_str(&format!("言語: {}\n", self.language));
+        
+        match &self.recording_mode {
+            RecordingMode::VoiceActivity { silence_threshold, silence_duration_ms } => {
+                output.push_str(&format!("録音モード: 音声検出 (閾値: {}, 無音時間: {}ms)\n", 
+                    silence_threshold, silence_duration_ms));
+            }
+            RecordingMode::PushToTalk { key } => {
+                output.push_str(&format!("録音モード: Push-To-Talk (キー: {})\n", key));
+            }
+            RecordingMode::Toggle { key } => {
+                output.push_str(&format!("録音モード: トグル (キー: {})\n", key));
+            }
+        }
+        
+        match &self.transcription_engine {
+            TranscriptionEngine::GPT4o => {
+                output.push_str(&format!("エンジン: GPT-4o\n"));
+            }
+            TranscriptionEngine::Whisper1 => {
+                output.push_str(&format!("エンジン: Whisper-1\n"));
+            }
+            TranscriptionEngine::WhisperCpp { path, model } => {
+                output.push_str(&format!("エンジン: Whisper.cpp\n"));
+                output.push_str(&format!("  パス: {}\n", path.display()));
+                output.push_str(&format!("  モデル: {}\n", model.display()));
+            }
+        }
+        
+        output.push_str(&format!("モデル: {}\n", self.model));
+        output.push_str(&format!("サンプルレート: {}\n", self.sample_rate));
+        output.push_str(&format!("チャンネル数: {}\n", self.channels));
+        output.push_str(&format!("最大録音時間: {:?}秒\n", self.max_recording_duration_sec));
+        output.push_str(&format!("無音除去: {}\n", if self.remove_silence { "有効" } else { "無効" }));
+        output.push_str(&format!("再生速度: {:.1}倍速\n", self.speed_factor));
+        
+        output
+    }
+    
+    /// CLIパラメータと設定ファイルから設定を作成
     pub fn new(
-        mode: &str,
-        lang: &str,
+        mode: Option<&str>,
+        lang: Option<&str>,
         ptt: Option<&str>,
-        engine: &str,
+        engine: Option<&str>,
         whisper_cpp_path: Option<&PathBuf>,
         whisper_cpp_model: Option<&PathBuf>,
+        toggle_key: Option<&str>,
+        model: Option<&str>,
     ) -> Result<Self> {
-        let mut config = Config::default();
+        // まず設定ファイルから読み込み
+        let mut config = Config::load().unwrap_or_default();
         
-        // 出力モードの設定
-        config.output_mode = OutputMode::from_str(mode)
-            .map_err(|e| anyhow!("{}", e))?;
+        // CLIパラメータで上書き
+        if let Some(mode_str) = mode {
+            config.output_mode = OutputMode::from_str(mode_str)
+                .map_err(|e| anyhow!("{}", e))?;
+        }
         
-        // 言語コードの設定
-        config.language = lang.to_string();
+        if let Some(lang_str) = lang {
+            config.language = lang_str.to_string();
+        }
         
-        // 録音モードの設定
         if let Some(key) = ptt {
             config.recording_mode = RecordingMode::PushToTalk {
                 key: key.to_string(),
             };
-        } else if let Ok(toggle_key) = env::var("TOGGLE_KEY") {
-            // TOGGLE_KEYを使用
+        } else if let Some(key) = toggle_key {
             config.recording_mode = RecordingMode::Toggle {
-                key: toggle_key,
-            };
-        } else if let Ok(start_key) = env::var("TOGGLE_START_KEY") {
-            // 後方互換性のために古い環境変数もサポート
-            warn!("TOGGLE_START_KEY/TOGGLE_STOP_KEYは非推奨です。代わりにTOGGLE_KEYを使用してください。");
-            config.recording_mode = RecordingMode::Toggle {
-                key: start_key,
+                key: key.to_string(),
             };
         }
         
-        // 音声認識エンジンの設定
-        match engine.to_lowercase().as_str() {
-            "gpt-4o" => {
-                config.transcription_engine = TranscriptionEngine::GPT4o;
+        if let Some(engine_str) = engine {
+            match engine_str.to_lowercase().as_str() {
+                "gpt-4o" => {
+                    config.transcription_engine = TranscriptionEngine::GPT4o;
+                }
+                "whisper-1" => {
+                    config.transcription_engine = TranscriptionEngine::Whisper1;
+                }
+                "whisper.cpp" | "whisper-cpp" => {
+                    let path = whisper_cpp_path.ok_or_else(|| anyhow!("Whisper.cppのパスが指定されていません"))?;
+                    let model = whisper_cpp_model.ok_or_else(|| anyhow!("Whisper.cppのモデルパスが指定されていません"))?;
+                    
+                    config.transcription_engine = TranscriptionEngine::WhisperCpp {
+                        path: path.clone(),
+                        model: model.clone(),
+                    };
+                }
+                _ => return Err(anyhow!("不明な音声認識エンジン: {}", engine_str)),
             }
-            "whisper-1" => {
-                config.transcription_engine = TranscriptionEngine::Whisper1;
-            }
-            "whisper.cpp" | "whisper-cpp" => {
-                let path = whisper_cpp_path.ok_or_else(|| anyhow!("Whisper.cppのパスが指定されていません"))?;
-                let model = whisper_cpp_model.ok_or_else(|| anyhow!("Whisper.cppのモデルパスが指定されていません"))?;
-                
-                config.transcription_engine = TranscriptionEngine::WhisperCpp {
-                    path: path.clone(),
-                    model: model.clone(),
-                };
-            }
-            _ => return Err(anyhow!("不明な音声認識エンジン: {}", engine)),
+        }
+        
+        if let Some(model_str) = model {
+            config.model = model_str.to_string();
+        }
+        
+        // トグルモードの場合、録音の最大持続時間を長く設定
+        if let RecordingMode::Toggle { .. } = config.recording_mode {
+            config.max_recording_duration_sec = Some(300); // 5分
         }
         
         // OpenAI APIキーの確認
         if config.openai_api_key.is_empty() {
-            warn!("OPENAI_API_KEYが設定されていません。環境変数または.envファイルで設定してください。");
+            warn!("OPENAI_API_KEYが設定されていません。設定ファイルで設定してください。");
             if matches!(config.transcription_engine, TranscriptionEngine::GPT4o | TranscriptionEngine::Whisper1) {
-                return Err(anyhow!("OpenAI APIを使用するには、OPENAI_API_KEYが必要です"));
+                return Err(anyhow!("OpenAI APIを使用するには、APIキーが必要です"));
             }
         }
         
         Ok(config)
+    }
+    
+    /// APIキーを設定
+    pub fn set_api_key(&mut self, api_key: &str) -> Result<()> {
+        self.openai_api_key = api_key.to_string();
+        self.save()?;
+        info!("APIキーを設定しました");
+        Ok(())
+    }
+    
+    /// 言語を設定
+    pub fn set_language(&mut self, lang: &str) -> Result<()> {
+        self.language = lang.to_string();
+        self.save()?;
+        info!("言語を設定しました: {}", lang);
+        Ok(())
+    }
+    
+    /// トグルキーを設定
+    pub fn set_toggle_key(&mut self, key: &str) -> Result<()> {
+        self.recording_mode = RecordingMode::Toggle {
+            key: key.to_string(),
+        };
+        self.save()?;
+        info!("トグルキーを設定しました: {}", key);
+        Ok(())
+    }
+    
+    /// PTTキーを設定
+    pub fn set_ptt_key(&mut self, key: &str) -> Result<()> {
+        self.recording_mode = RecordingMode::PushToTalk {
+            key: key.to_string(),
+        };
+        self.save()?;
+        info!("PTTキーを設定しました: {}", key);
+        Ok(())
+    }
+    
+    /// モデルを設定
+    pub fn set_model(&mut self, model: &str) -> Result<()> {
+        self.model = model.to_string();
+        self.save()?;
+        info!("モデルを設定しました: {}", model);
+        Ok(())
+    }
+    
+    /// 音声検出モードを設定
+    pub fn set_voice_activity(&mut self, threshold: f32, duration_ms: u32) -> Result<()> {
+        self.recording_mode = RecordingMode::VoiceActivity {
+            silence_threshold: threshold,
+            silence_duration_ms: duration_ms,
+        };
+        self.save()?;
+        info!("音声検出モードを設定しました (閾値: {}, 無音時間: {}ms)", threshold, duration_ms);
+        Ok(())
+    }
+    
+    /// 無音除去を設定
+    pub fn set_remove_silence(&mut self, enable: bool) -> Result<()> {
+        self.remove_silence = enable;
+        self.save()?;
+        info!("無音除去を{}に設定しました", if enable { "有効" } else { "無効" });
+        Ok(())
+    }
+    
+    /// 再生速度を設定
+    pub fn set_speed_factor(&mut self, factor: f32) -> Result<()> {
+        self.speed_factor = factor;
+        self.save()?;
+        info!("再生速度を{:.1}倍に設定しました", factor);
+        Ok(())
     }
 } 

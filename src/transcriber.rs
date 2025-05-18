@@ -196,17 +196,18 @@ fn transcribe_with_openai(config: &Config, model: &str, wav_data: &[u8]) -> Resu
         return Err(anyhow!("OpenAI APIキーが設定されていません"));
     }
     
-    // GPT-4oモデルのときはgpt-4o-transcribe、それ以外はwhisper-1を使用
-    let transcription_model = if model == "gpt-4o" {
-        "gpt-4o-transcribe"
-    } else {
-        "whisper-1"
+    // モデルを決定する - 引数で指定されたものがあればそれを使用、なければ設定ファイルのモデルを使用
+    let transcription_model = match model {
+        "gpt-4o" => "gpt-4o-transcribe", // 後方互換性のため
+        _ => &config.model,
     };
+    
     let url = "https://api.openai.com/v1/audio/transcriptions";
     
     // 処理された音声データの情報をログに出力
     let wav_duration = audio_duration_sec(wav_data)?;
     debug!("音声データの処理: 長さ {:.2}秒, サイズ {} バイト", wav_duration, wav_data.len());
+    debug!("使用するモデル: {}", transcription_model);
     
     let mut retry_count = 0;
     loop {

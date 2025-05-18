@@ -35,6 +35,8 @@ rdev = "0.5"
 whisper-rs = { version = "0.10", optional = true }
 # 一時ファイル
 tempfile = "3.9"
+# 設定ファイルパス
+directories = "5.0"
 
 [features]
 default = ["audio_backend"]

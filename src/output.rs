@@ -35,21 +35,8 @@ impl OutputManager {
         while let Some(result) = self.result_rx.recv().await {
             debug!("OutputManager: 結果を受信: {}", result.text);
             
-            match self.config.output_mode {
-                OutputMode::Clipboard => {
-                    self.copy_to_clipboard(&result.text)?;
-                }
-                OutputMode::Type => {
-                    self.type_text(&result.text).await?;
-                }
-                OutputMode::Both => {
-                    self.copy_to_clipboard(&result.text)?;
-                    
-                    // 少し待ってからタイプ
-                    sleep(Duration::from_millis(100)).await;
-                    self.type_text(&result.text).await?;
-                }
-            }
+            // すべてクリップボードに出力
+            self.copy_to_clipboard(&result.text)?;
         }
         
         info!("OutputManager: 結果処理を終了します");
@@ -78,7 +65,8 @@ impl OutputManager {
         Ok(())
     }
 
-    /// テキストをタイピング
+    /// テキストをタイピング（将来のために保持）
+    #[allow(dead_code)]
     async fn type_text(&self, text: &str) -> Result<()> {
         info!("テキストをタイプします ({} 文字)", text.len());
         
