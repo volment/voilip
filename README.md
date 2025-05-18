@@ -8,6 +8,7 @@ voilipは、PC上での文書作成やチャット入力を高速化するため
 - **クリップボード出力**: 認識結果を自動的にクリップボードにコピー
 - **柔軟な録音制御**: 無音検知、Push-To-Talk、またはトグルキーによる制御
 - **複合キー対応**: META+j、CTRL+aなどの複合キー（修飾キー+英数字）をサポート
+- **視覚的フィードバック**: 録音開始・停止時のデスクトップ通知とログ表示
 - **プラットフォーム対応**: Linux（X11/Wayland）とmacOSで同一コードベースが動作
 - **オフラインFallback**: Whisper.cppによるローカル音声認識の選択も可能
 - **音声処理の最適化**: 無音除去、可変速度再生をサポート
@@ -145,9 +146,12 @@ voilip test --test-file sample.wav
 以下のような様々な組み合わせが利用可能です：
 
 - ファンクションキー: `F9`, `F10`, `F12`
-- 修飾キー + アルファベット: `CTRL+j`, `META+k`, `SUPER+s`, `ALT+z`
+- 修飾キー + アルファベット: `CTRL+j`, `META+k`, `SUPER+s`, `ALT+z`, `ALTGR+a`
 - 修飾キー + 数字: `SHIFT+1`, `CTRL+9`
 - 修飾キー + ファンクションキー: `CTRL+F10`, `ALT+F4`
+- 矢印キー: `UP`, `DOWN`, `LEFT`, `RIGHT`
+- マルチメディアキー: `PLAYPAUSE`, `VOLUMEUP`, `VOLUMEDOWN`, `MUTE`
+- 特殊キー: `HOME`, `END`, `PAGEUP`, `PAGEDOWN`, `INSERT`, `DELETE`
 
 ## 音声処理機能
 

@@ -247,102 +247,98 @@ impl AudioBuffer {
 
     /// 録音を開始
     pub fn start_recording(&self) -> Result<()> {
-        if !self.is_recording.load(Ordering::SeqCst) {
-            info!("録音を開始します");
-            // 通知を表示
-            let _ = show_notification("音声入力", "録音を開始しました");
-            
-            // 録音開始時間を設定
-            let mut recording_start = self.recording_start_time.lock().map_err(|_| anyhow!("録音時間ロックエラー"))?;
-            *recording_start = Some(Instant::now());
-            
-            // バッファをクリア（録音開始時に空の状態から始める）
-            let mut buffer = self.buffer.lock().map_err(|_| anyhow!("バッファロックエラー"))?;
-            buffer.clear();
-            
-            // 蓄積バッファをクリア
-            let mut accumulated = self.accumulated_samples.lock().map_err(|_| anyhow!("蓄積バッファロックエラー"))?;
-            accumulated.clear();
-            
-            self.is_recording.store(true, Ordering::SeqCst);
-            
-            // 録音開始時に送信しない（音声データを受信してから送信する）
+        // すでに録音中なら何もしない
+        if self.is_recording.load(Ordering::SeqCst) {
+            return Ok(());
         }
+        
+        // 録音フラグをセット
+        self.is_recording.store(true, Ordering::SeqCst);
+        
+        // 録音開始時間を記録
+        let mut recording_start = self.recording_start_time.lock().map_err(|_| anyhow!("録音時間ロックエラー"))?;
+        *recording_start = Some(Instant::now());
+        
+        // 最初の音声アクティビティ時間を設定
+        let mut last_activity = self.last_voice_activity.lock().map_err(|_| anyhow!("アクティビティロックエラー"))?;
+        *last_activity = Some(Instant::now());
+        
+        // 蓄積バッファをクリア
+        let mut accumulated = self.accumulated_samples.lock().map_err(|_| anyhow!("蓄積バッファロックエラー"))?;
+        accumulated.clear();
+        
+        info!("録音を開始しました");
+        
+        // 録音開始の通知を表示
+        show_notification("voilip", "録音を開始しました 🎤")?;
+        
         Ok(())
     }
 
     /// 録音を停止
     pub fn stop_recording(&self) -> Result<()> {
-        if self.is_recording.load(Ordering::SeqCst) {
-            info!("録音を停止します");
-            // 通知を表示
-            let _ = show_notification("音声入力", "録音を停止しました");
+        // 録音中でなければ何もしない
+        if !self.is_recording.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        
+        let mut buffer = self.buffer.lock().map_err(|_| anyhow!("バッファロックエラー"))?;
+        
+        // 録音フラグを解除
+        self.is_recording.store(false, Ordering::SeqCst);
+        
+        // バッファが空でなければ処理を実行
+        if !buffer.is_empty() {
+            // バッファの内容をベクターに変換
+            let mut samples: Vec<f32> = buffer.iter().copied().collect();
             
-            // 録音開始時間をリセット
-            let mut recording_start = self.recording_start_time.lock().map_err(|_| anyhow!("録音時間ロックエラー"))?;
-            *recording_start = None;
-            
-            self.is_recording.store(false, Ordering::SeqCst);
-            
-            // トグルモードの場合は蓄積バッファを送信
-            let accumulated = self.accumulated_samples.lock().map_err(|_| anyhow!("蓄積バッファロックエラー"))?;
+            // トグルモードの場合は蓄積バッファを使用
+            let mut accumulated = self.accumulated_samples.lock().map_err(|_| anyhow!("蓄積バッファロックエラー"))?;
             if !accumulated.is_empty() {
-                debug!("トグルモード: 蓄積バッファからサンプル送信 ({} サンプル)", accumulated.len());
-                
-                // 処理前のデータをクローン
-                let mut samples = accumulated.clone();
-                
-                // 無音除去処理
-                if self.remove_silence {
-                    samples = self.remove_silence_from_samples(samples)?;
-                    debug!("無音除去後: {} サンプル", samples.len());
-                }
-                
-                // 速度変更処理
-                if self.speed_factor != 1.0 {
-                    samples = self.change_speed(samples, self.speed_factor)?;
-                    debug!("速度変更後（{}倍速）: {} サンプル", self.speed_factor, samples.len());
-                }
-                
-                // 非同期チャネルへ送信
-                let tx = self.tx.clone();
-                // 送信エラーは無視（受信側が閉じている場合）
-                let _ = tx.try_send(samples);
-                
-                // バッファをクリア
-                drop(accumulated); // 現在のロックを解放
-                let mut accumulated_mut = self.accumulated_samples.lock().map_err(|_| anyhow!("蓄積バッファロックエラー"))?;
-                accumulated_mut.clear();
-            } else {
-                // 蓄積バッファが空の場合は通常バッファから送信
-                let buffer = self.buffer.lock().map_err(|_| anyhow!("バッファロックエラー"))?;
-                let mut samples: Vec<f32> = buffer.iter().copied().collect();
-                
-                if !samples.is_empty() {
-                    // 無音除去処理
-                    if self.remove_silence {
-                        samples = self.remove_silence_from_samples(samples)?;
-                        debug!("無音除去後: {} サンプル", samples.len());
-                    }
-                    
-                    // 速度変更処理
-                    if self.speed_factor != 1.0 {
-                        samples = self.change_speed(samples, self.speed_factor)?;
-                        debug!("速度変更後（{}倍速）: {} サンプル", self.speed_factor, samples.len());
-                    }
-                    
-                    // 非同期チャネルへ送信（非同期ランタイム外からも安全に送信）
-                    let tx = self.tx.clone();
-                    // 送信エラーは無視（受信側が閉じている場合）
-                    let _ = tx.try_send(samples);
+                debug!("トグルモード: 蓄積バッファを使用 ({} サンプル)", accumulated.len());
+                samples = accumulated.clone();
+                accumulated.clear();
+            }
+            
+            // 無音除去を適用
+            if self.remove_silence && !samples.is_empty() {
+                match self.remove_silence_from_samples(&samples) {
+                    Ok(filtered) => samples = filtered,
+                    Err(e) => error!("無音除去エラー: {}", e),
                 }
             }
+            
+            // 速度変更を適用
+            if self.speed_factor != 1.0 && !samples.is_empty() {
+                match self.change_speed(&samples, self.speed_factor) {
+                    Ok(speed_changed) => samples = speed_changed,
+                    Err(e) => error!("速度変更エラー: {}", e),
+                }
+            }
+            
+            // バッファをクリア
+            buffer.clear();
+            
+            // 非同期チャネルへ送信
+            if !samples.is_empty() {
+                let tx = self.tx.clone();
+                let sample_duration_sec = samples.len() as f32 / 16000.0; // 16kHzサンプリング
+                debug!("録音を送信: {:.2}秒 ({} サンプル)", sample_duration_sec, samples.len());
+                
+                let _ = tx.try_send(samples);
+            }
         }
+        
+        info!("録音を停止しました");
+        
+        // 録音停止の通知を表示
+        show_notification("voilip", "録音を停止しました ✓")?;
+        
         Ok(())
     }
 
     /// 無音部分を除去して音声部分だけを連結する
-    fn remove_silence_from_samples(&self, samples: Vec<f32>) -> Result<Vec<f32>> {
+    fn remove_silence_from_samples(&self, samples: &[f32]) -> Result<Vec<f32>> {
         let threshold = 0.01; // 無音判定の閾値
         let min_segment_len = 1600; // 最小音声セグメント長（0.1秒相当@16kHz）
         
@@ -350,7 +346,7 @@ impl AudioBuffer {
         let mut current_segment = Vec::new();
         let mut is_speech = false;
         
-        for sample in samples {
+        for &sample in samples {
             if sample.abs() > threshold {
                 is_speech = true;
                 current_segment.push(sample);
@@ -391,9 +387,9 @@ impl AudioBuffer {
     }
     
     /// 音声の速度を変更する
-    fn change_speed(&self, samples: Vec<f32>, speed_factor: f32) -> Result<Vec<f32>> {
+    fn change_speed(&self, samples: &[f32], speed_factor: f32) -> Result<Vec<f32>> {
         if speed_factor == 1.0 {
-            return Ok(samples);
+            return Ok(samples.to_vec());
         }
         
         let new_len = (samples.len() as f32 / speed_factor) as usize;
@@ -511,7 +507,7 @@ impl AudioCapture {
 
     /// PushToTalkモードの制御を設定
     pub fn setup_ptt_control(&mut self) -> Result<()> {
-        if let RecordingMode::PushToTalk { key } = &self.config.recording_mode.clone() {
+        if let RecordingMode::PushToTalk { key } = &self.config.recording_mode {
             info!("Push-To-Talk キー: {}", key);
             
             // キー名を設定
@@ -533,6 +529,9 @@ impl AudioCapture {
             } else {
                 None
             };
+            
+            // キー情報をクローンしてスレッドに渡す
+            let key_clone = key.clone();
             
             // 修飾キーの状態を追跡
             let modifier_pressed = Arc::new(AtomicBool::new(false));
@@ -564,6 +563,15 @@ impl AudioCapture {
                                         key_event);
                                     if let Err(e) = audio_buffer.start_recording() {
                                         error!("録音開始エラー: {}", e);
+                                    } else {
+                                        // キー入力フィードバック（録音開始）
+                                        let key_name = if is_composite {
+                                            let parts: Vec<&str> = key_clone.split("+").collect();
+                                            format!("{}+{}", parts[0].trim(), parts[1].trim())
+                                        } else {
+                                            key_clone.to_string()
+                                        };
+                                        info!("PTTキー {} で録音を開始しました", key_name);
                                     }
                                 }
                             }
@@ -579,6 +587,11 @@ impl AudioCapture {
                                         debug!("修飾キーリリースでPTT停止");
                                         if let Err(e) = audio_buffer.stop_recording() {
                                             error!("録音停止エラー: {}", e);
+                                        } else {
+                                            // キー入力フィードバック（録音停止）
+                                            let parts: Vec<&str> = key_clone.split("+").collect();
+                                            let key_name = format!("{}+{}", parts[0].trim(), parts[1].trim());
+                                            info!("修飾キーリリースで録音を停止しました ({})", key_name);
                                         }
                                     }
                                 }
@@ -591,6 +604,15 @@ impl AudioCapture {
                                     debug!("PTTキー解放: {:?}", key_event);
                                     if let Err(e) = audio_buffer.stop_recording() {
                                         error!("録音停止エラー: {}", e);
+                                    } else {
+                                        // キー入力フィードバック（録音停止）
+                                        let key_name = if is_composite {
+                                            let parts: Vec<&str> = key_clone.split("+").collect();
+                                            format!("{}+{}", parts[0].trim(), parts[1].trim())
+                                        } else {
+                                            key_clone.to_string()
+                                        };
+                                        info!("PTTキー {} のリリースで録音を停止しました", key_name);
                                     }
                                 }
                             }
@@ -612,7 +634,7 @@ impl AudioCapture {
 
     /// トグルモードの制御を設定
     pub fn setup_toggle_control(&mut self) -> Result<()> {
-        if let RecordingMode::Toggle { key } = &self.config.recording_mode.clone() {
+        if let RecordingMode::Toggle { key } = &self.config.recording_mode {
             info!("トグルキー: {}", key);
             
             // キー名を設定
@@ -635,9 +657,11 @@ impl AudioCapture {
                 None
             };
             
+            // キー情報をクローンしてスレッドに渡す
+            let key_clone = key.clone();
+            
             // 修飾キーの状態を追跡
             let modifier_pressed = Arc::new(AtomicBool::new(false));
-            let modifier_pressed_clone = modifier_pressed.clone();
             
             // キー入力監視スレッドを作成
             let handle = thread::spawn(move || {
@@ -669,10 +693,28 @@ impl AudioCapture {
                                     if audio_buffer.is_recording() {
                                         if let Err(e) = audio_buffer.stop_recording() {
                                             error!("録音停止エラー: {}", e);
+                                        } else {
+                                            // キー入力フィードバック（録音停止）
+                                            let key_name = if is_composite {
+                                                let parts: Vec<&str> = key_clone.split("+").collect();
+                                                format!("{}+{}", parts[0].trim(), parts[1].trim())
+                                            } else {
+                                                key_clone.to_string()
+                                            };
+                                            info!("トグルキー {} で録音を停止しました", key_name);
                                         }
                                     } else {
                                         if let Err(e) = audio_buffer.start_recording() {
                                             error!("録音開始エラー: {}", e);
+                                        } else {
+                                            // キー入力フィードバック（録音開始）
+                                            let key_name = if is_composite {
+                                                let parts: Vec<&str> = key_clone.split("+").collect();
+                                                format!("{}+{}", parts[0].trim(), parts[1].trim())
+                                            } else {
+                                                key_clone.to_string()
+                                            };
+                                            info!("トグルキー {} で録音を開始しました", key_name);
                                         }
                                     }
                                 }
@@ -888,11 +930,34 @@ fn parse_key_name(key_name: &str) -> Key {
             "RCTRL" => Key::ControlRight,
             "ALT" | "LALT" => Key::Alt,
             "RALT" => Key::Alt,
+            "ALTGR" => Key::AltGr,
             "META" | "SUPER" | "LMETA" | "LSUPER" => Key::Unknown(0xE05B), // Windows/Super key
             "RMETA" | "RSUPER" => Key::Unknown(0xE05C), // Right Windows/Super key
             "SPACE" => Key::Space,
             "TAB" => Key::Tab,
             "ESCAPE" | "ESC" => Key::Escape,
+            // マルチメディアキー（rdevでサポートされていないのでUnknownとして処理）
+            "PLAY" | "PAUSE" | "PLAYPAUSE" => Key::Unknown(0xE022), // Play/Pause
+            "STOP" => Key::Unknown(0xE024), // Media Stop
+            "NEXT" | "NEXTTRACK" => Key::Unknown(0xE019), // Next Track
+            "PREV" | "PREVTRACK" => Key::Unknown(0xE010), // Previous Track
+            "VOLUMEUP" => Key::Unknown(0xE030), // Volume Up
+            "VOLUMEDOWN" => Key::Unknown(0xE02E), // Volume Down
+            "MUTE" => Key::Unknown(0xE020), // Volume Mute
+            // その他の特殊キー
+            "PRINT" | "PRINTSCREEN" => Key::PrintScreen,
+            "SCROLLLOCK" => Key::ScrollLock,
+            "PAUSE" => Key::Pause,
+            "INSERT" => Key::Insert,
+            "HOME" => Key::Home,
+            "PAGEUP" => Key::PageUp,
+            "DELETE" => Key::Delete,
+            "END" => Key::End,
+            "PAGEDOWN" => Key::PageDown,
+            "RIGHT" => Key::RightArrow,
+            "LEFT" => Key::LeftArrow,
+            "DOWN" => Key::DownArrow,
+            "UP" => Key::UpArrow,
             _ => {
                 warn!("未対応のキー名: {}、CapsLockにフォールバック", key_name);
                 Key::CapsLock
