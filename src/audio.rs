@@ -59,7 +59,15 @@ impl AudioBuffer {
             (0.01, 1000) // デフォルト値
         };
         
+        // トグルモードでは雑音を誤検出しないよう、閾値を高めに設定
+        let actual_threshold = match &config.recording_mode {
+            RecordingMode::Toggle { .. } => silence_threshold * 2.5, // トグルモードではより高い閾値を使用
+            _ => silence_threshold,
+        };
+        
         let mut has_voice = false;
+        let mut significant_voice = false; // 実際に意味のある音声かどうか
+        let mut max_amplitude = 0.0f32;
         
         // サンプルをf32に変換してバッファに追加
         for &sample in samples {
@@ -71,15 +79,42 @@ impl AudioBuffer {
             }
             buffer.push_back(sample_f32);
             
-            // 音声アクティビティの検出
-            if sample_f32.abs() > silence_threshold {
+            // 音声アクティビティの検出と最大振幅の記録
+            let amplitude = sample_f32.abs();
+            if amplitude > actual_threshold {
                 has_voice = true;
+                if amplitude > max_amplitude {
+                    max_amplitude = amplitude;
+                }
+            }
+            
+            // より強い音声（意味のある音声）の検出
+            if amplitude > actual_threshold * 2.0 {
+                significant_voice = true;
             }
         }
         
         // 録音中かつトグルモードの場合は蓄積バッファにも追加
         if is_recording && matches!(config.recording_mode, RecordingMode::Toggle { .. }) {
-            if has_voice {
+            // 有意な音声がある場合のみ追加（雑音は含めない）
+            if significant_voice {
+                let mut accumulated = self.accumulated_samples.lock().map_err(|_| anyhow!("蓄積バッファロックエラー"))?;
+                for &sample in samples {
+                    accumulated.push(sample.to_float_sample());
+                }
+                
+                // 意味のある音声がある場合はログを出力
+                static mut LAST_LOG_TIME: Option<Instant> = None;
+                let now = Instant::now();
+                
+                unsafe {
+                    if LAST_LOG_TIME.is_none() || now.duration_since(LAST_LOG_TIME.unwrap()).as_millis() > 500 {
+                        debug!("トグルモード: 音声アクティビティを検出 (最大振幅: {:.5})", max_amplitude);
+                        LAST_LOG_TIME = Some(now);
+                    }
+                }
+            } else if max_amplitude > 0.005 {
+                // 弱い音声も蓄積（ただしノイズは除外）
                 let mut accumulated = self.accumulated_samples.lock().map_err(|_| anyhow!("蓄積バッファロックエラー"))?;
                 for &sample in samples {
                     accumulated.push(sample.to_float_sample());
@@ -87,8 +122,8 @@ impl AudioBuffer {
             }
         }
         
-        // 音声アクティビティの状態更新
-        if has_voice {
+        // 音声アクティビティの状態更新 - significant_voiceを使用
+        if significant_voice {
             *last_activity = Some(Instant::now());
         }
         
@@ -147,9 +182,8 @@ impl AudioBuffer {
             }
         } else if let RecordingMode::Toggle { .. } = &config.recording_mode {
             // トグルモードでは無音検出しても録音を継続
-            if is_recording && has_voice {
-                // 音声アクティビティを記録（デバッグ目的）
-                debug!("トグルモード: 音声アクティビティを検出");
+            if is_recording && significant_voice {
+                debug!("トグルモード: 有効な音声を検出しました");
             }
         }
         
