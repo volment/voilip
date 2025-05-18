@@ -31,6 +31,10 @@ pub struct AudioBuffer {
     accumulated_samples: Arc<Mutex<Vec<f32>>>,
     /// トグルモードの無音時間しきい値（秒）
     toggle_silence_threshold_sec: u32,
+    /// 無音除去フラグ
+    remove_silence: bool,
+    /// 速度倍率
+    speed_factor: f32,
 }
 
 impl AudioBuffer {
@@ -44,6 +48,8 @@ impl AudioBuffer {
             recording_start_time: Arc::new(Mutex::new(None)),
             accumulated_samples: Arc::new(Mutex::new(Vec::new())),
             toggle_silence_threshold_sec: 10, // トグルモードで10秒無音で自動停止
+            remove_silence: true, // デフォルトで無音除去を有効化
+            speed_factor: 1.1, // デフォルトで1.1倍速
         }
     }
 
@@ -282,22 +288,49 @@ impl AudioBuffer {
             let accumulated = self.accumulated_samples.lock().map_err(|_| anyhow!("蓄積バッファロックエラー"))?;
             if !accumulated.is_empty() {
                 debug!("トグルモード: 蓄積バッファからサンプル送信 ({} サンプル)", accumulated.len());
+                
+                // 処理前のデータをクローン
+                let mut samples = accumulated.clone();
+                
+                // 無音除去処理
+                if self.remove_silence {
+                    samples = self.remove_silence_from_samples(samples)?;
+                    debug!("無音除去後: {} サンプル", samples.len());
+                }
+                
+                // 速度変更処理
+                if self.speed_factor != 1.0 {
+                    samples = self.change_speed(samples, self.speed_factor)?;
+                    debug!("速度変更後（{}倍速）: {} サンプル", self.speed_factor, samples.len());
+                }
+                
                 // 非同期チャネルへ送信
                 let tx = self.tx.clone();
-                let samples = accumulated.clone();
                 // 送信エラーは無視（受信側が閉じている場合）
                 let _ = tx.try_send(samples);
                 
-                // バッファをクリア (追加)
+                // バッファをクリア
                 drop(accumulated); // 現在のロックを解放
                 let mut accumulated_mut = self.accumulated_samples.lock().map_err(|_| anyhow!("蓄積バッファロックエラー"))?;
                 accumulated_mut.clear();
             } else {
                 // 蓄積バッファが空の場合は通常バッファから送信
                 let buffer = self.buffer.lock().map_err(|_| anyhow!("バッファロックエラー"))?;
-                let samples: Vec<f32> = buffer.iter().copied().collect();
+                let mut samples: Vec<f32> = buffer.iter().copied().collect();
                 
                 if !samples.is_empty() {
+                    // 無音除去処理
+                    if self.remove_silence {
+                        samples = self.remove_silence_from_samples(samples)?;
+                        debug!("無音除去後: {} サンプル", samples.len());
+                    }
+                    
+                    // 速度変更処理
+                    if self.speed_factor != 1.0 {
+                        samples = self.change_speed(samples, self.speed_factor)?;
+                        debug!("速度変更後（{}倍速）: {} サンプル", self.speed_factor, samples.len());
+                    }
+                    
                     // 非同期チャネルへ送信（非同期ランタイム外からも安全に送信）
                     let tx = self.tx.clone();
                     // 送信エラーは無視（受信側が閉じている場合）
@@ -306,6 +339,74 @@ impl AudioBuffer {
             }
         }
         Ok(())
+    }
+
+    /// 無音部分を除去して音声部分だけを連結する
+    fn remove_silence_from_samples(&self, samples: Vec<f32>) -> Result<Vec<f32>> {
+        let threshold = 0.01; // 無音判定の閾値
+        let min_segment_len = 1600; // 最小音声セグメント長（0.1秒相当@16kHz）
+        
+        let mut result = Vec::new();
+        let mut current_segment = Vec::new();
+        let mut is_speech = false;
+        
+        for sample in samples {
+            if sample.abs() > threshold {
+                is_speech = true;
+                current_segment.push(sample);
+            } else if is_speech {
+                current_segment.push(sample);
+                
+                // 無音が続く場合、セグメントを終了
+                if current_segment.len() > 800 && current_segment.iter().rev().take(800).all(|s| s.abs() <= threshold) {
+                    // 末尾の無音を除去
+                    let speech_end = current_segment.len() - current_segment.iter().rev()
+                        .position(|s| s.abs() > threshold)
+                        .unwrap_or(current_segment.len());
+                    
+                    if speech_end > min_segment_len {
+                        // 有効な音声セグメントを結果に追加
+                        result.extend_from_slice(&current_segment[0..speech_end]);
+                    }
+                    
+                    current_segment.clear();
+                    is_speech = false;
+                }
+            }
+        }
+        
+        // 最後のセグメントを処理
+        if !current_segment.is_empty() && current_segment.len() > min_segment_len {
+            // 末尾の無音を除去
+            let speech_end = current_segment.len() - current_segment.iter().rev()
+                .position(|s| s.abs() > threshold)
+                .unwrap_or(current_segment.len());
+            
+            if speech_end > min_segment_len {
+                result.extend_from_slice(&current_segment[0..speech_end]);
+            }
+        }
+        
+        Ok(result)
+    }
+    
+    /// 音声の速度を変更する
+    fn change_speed(&self, samples: Vec<f32>, speed_factor: f32) -> Result<Vec<f32>> {
+        if speed_factor == 1.0 {
+            return Ok(samples);
+        }
+        
+        let new_len = (samples.len() as f32 / speed_factor) as usize;
+        let mut result = Vec::with_capacity(new_len);
+        
+        for i in 0..new_len {
+            let src_idx = (i as f32 * speed_factor) as usize;
+            if src_idx < samples.len() {
+                result.push(samples[src_idx]);
+            }
+        }
+        
+        Ok(result)
     }
 
     /// 現在録音中かどうか

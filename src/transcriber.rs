@@ -204,6 +204,10 @@ fn transcribe_with_openai(config: &Config, model: &str, wav_data: &[u8]) -> Resu
     };
     let url = "https://api.openai.com/v1/audio/transcriptions";
     
+    // 処理された音声データの情報をログに出力
+    let wav_duration = audio_duration_sec(wav_data)?;
+    debug!("音声データの処理: 長さ {:.2}秒, サイズ {} バイト", wav_duration, wav_data.len());
+    
     let mut retry_count = 0;
     loop {
         // WAVファイルを一時ファイルに書き出す
