@@ -5,10 +5,12 @@ voilipは、PC上での文書作成やチャット入力を高速化するため
 ## 機能
 
 - **リアルタイム文字起こし**: マイク入力からOpenAI GPT-4o-Transcribe / Whisper-1 / Whisper.cppを使用して音声認識
-- **複数の出力モード**: クリップボードへのコピー、アクティブウィンドウへのタイピング、または両方を選択可能
+- **クリップボード出力**: 認識結果を自動的にクリップボードにコピー
 - **柔軟な録音制御**: 無音検知、Push-To-Talk、またはトグルキーによる制御
+- **複合キー対応**: META+j、CTRL+aなどの複合キー（修飾キー+英数字）をサポート
 - **プラットフォーム対応**: Linux（X11/Wayland）とmacOSで同一コードベースが動作
 - **オフラインFallback**: Whisper.cppによるローカル音声認識の選択も可能
+- **音声処理の最適化**: 無音除去、可変速度再生をサポート
 
 ## インストール
 
@@ -21,9 +23,6 @@ voilipは、PC上での文書作成やチャット入力を高速化するため
 - クリップボード関連ツール: 
   - Linux: `xclip` または `xsel` (X11), `wl-clipboard` (Wayland)
   - macOS: 標準機能
-- キーストローク送信ツール:
-  - Linux: `xdotool` (X11), `wtype` (Wayland)
-  - macOS: 標準機能
 - OpenAI API Key (GPT-4oまたはWhisper-1使用時)
 
 ### ビルド方法
@@ -34,10 +33,10 @@ git clone https://github.com/yourusername/voilip.git
 cd voilip
 
 # 依存関係のインストール (Ubuntu/Debian)
-sudo apt-get install libasound2-dev libx11-dev xclip xdotool
+sudo apt-get install libasound2-dev libx11-dev xclip
 
 # Wayland環境では以下も必要
-sudo apt-get install wl-clipboard wtype
+sudo apt-get install wl-clipboard
 
 # コンパイル
 cargo build --release
@@ -55,7 +54,6 @@ Nixユーザーの場合は、以下の依存関係を含む開発環境を使�
 pkgs.alsa-lib
 pkgs.xorg.libX11
 pkgs.xclip
-pkgs.xdotool
 ```
 
 Nix環境で実行:
@@ -73,24 +71,59 @@ cargo build --release --features whisper-cpp
 
 ## 使用方法
 
-まず`.env`ファイルを作成し、OpenAIのAPIキーを設定します:
+### 設定
 
+初回実行時に設定ファイルが自動作成されます。設定は`config`コマンドで管理します：
+
+```bash
+# 現在の設定を表示
+voilip config show
+
+# APIキーを設定
+voilip config set-api-key "your_api_key_here"
+
+# トグルキーを設定（例: F9、CTRL+j、META+sなど）
+voilip config set-toggle-key "CTRL+j"
+
+# 言語を設定
+voilip config set-language "ja"
+
+# モデルを設定
+voilip config set-model "gpt-4o-transcribe"
+
+# 無音除去を有効/無効に設定
+voilip config set-remove-silence true
+
+# 再生速度を設定（例: 1.5倍速）
+voilip config set-speed-factor 1.5
 ```
-OPENAI_API_KEY=your_api_key_here
-```
+
+設定ファイルの保存先：
+- Linux: `~/.config/voilip/config.json`
+- macOS: `~/Library/Application Support/com.volment.voilip/config.json`
 
 ### 基本的な使い方
 
 OpenAI GPT-4oで音声認識し、クリップボードにコピー:
 
 ```bash
-voilip start --mode clipboard --lang ja
+voilip start
 ```
 
-Push-To-Talkモードでの使用:
+コマンドライン引数で設定を一時的に上書き:
 
 ```bash
-voilip start --mode both --lang ja --ptt F10
+# 言語を英語に変更して起動
+voilip start --lang en
+
+# トグルキーを指定して起動
+voilip start --toggle "CTRL+j"
+
+# Push-To-Talkモードで使用
+voilip start --ptt "F10"
+
+# 特定のモデルを指定
+voilip start --model "whisper-1"
 ```
 
 Whisper.cppを使用（オフラインモード）:
@@ -104,23 +137,23 @@ voilip start --engine whisper-cpp --whisper-cpp-path ~/bin/whisper --whisper-cpp
 WAVファイルから文字起こしをテスト:
 
 ```bash
-voilip test --test-file sample.wav --model whisper-1
+voilip test --test-file sample.wav
 ```
 
-## 設定
+## トグルキーの設定例
 
-設定は、コマンドライン引数と`.env`ファイルを組み合わせて行います。
+以下のような様々な組み合わせが利用可能です：
 
-### 環境変数 (`.env`ファイル)
+- ファンクションキー: `F9`, `F10`, `F12`
+- 修飾キー + アルファベット: `CTRL+j`, `META+k`, `SUPER+s`, `ALT+z`
+- 修飾キー + 数字: `SHIFT+1`, `CTRL+9`
+- 修飾キー + ファンクションキー: `CTRL+F10`, `ALT+F4`
 
-```
-# 必須
-OPENAI_API_KEY=your_api_key_here
+## 音声処理機能
 
-# オプション
-TOGGLE_START_KEY=F9
-TOGGLE_STOP_KEY=F10
-```
+- **無音除去**: 録音中の無音部分を自動的に削除し、意味のある音声だけを連結
+- **速度調整**: 音声を1.1～1.5倍速など、好みの速度に調整可能
+- **無音自動停止**: トグルモードで一定時間（デフォルト10秒）無音が続くと自動的に録音を停止
 
 ## システム要件
 
