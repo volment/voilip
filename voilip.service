@@ -1,0 +1,17 @@
+[Unit]
+Description=voilip CLI音声入力ユーティリティ
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/volment/repos/voilip/target/release/voilip start
+# 必要に応じて以下のオプションを追加
+# --lang ja
+# --toggle "CTRL+j"
+# --model "gpt-4o-transcribe"
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target
