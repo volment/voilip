@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 use rdev::{listen, Event, EventType, Key};
 use std::thread;
+use std::process::Command;
 
 use crate::config::{Config, RecordingMode};
 
@@ -24,6 +25,10 @@ pub struct AudioBuffer {
     is_recording: Arc<AtomicBool>,
     /// 音声データチャネル
     tx: mpsc::Sender<Vec<f32>>,
+    /// 録音開始時間
+    recording_start_time: Arc<Mutex<Option<Instant>>>,
+    /// トグルモード用蓄積バッファ
+    accumulated_samples: Arc<Mutex<Vec<f32>>>,
 }
 
 impl AudioBuffer {
@@ -34,6 +39,8 @@ impl AudioBuffer {
             last_voice_activity: Arc::new(Mutex::new(None)),
             is_recording: Arc::new(AtomicBool::new(false)),
             tx,
+            recording_start_time: Arc::new(Mutex::new(None)),
+            accumulated_samples: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -41,6 +48,7 @@ impl AudioBuffer {
     pub fn push_samples<T: Sample<Float = f32>>(&self, samples: &[T], config: &Config) -> Result<()> {
         let mut buffer = self.buffer.lock().map_err(|_| anyhow!("バッファロックエラー"))?;
         let mut last_activity = self.last_voice_activity.lock().map_err(|_| anyhow!("アクティビティロックエラー"))?;
+        let mut recording_start = self.recording_start_time.lock().map_err(|_| anyhow!("録音時間ロックエラー"))?;
         
         let is_recording = self.is_recording.load(Ordering::SeqCst);
         
@@ -69,12 +77,60 @@ impl AudioBuffer {
             }
         }
         
+        // 録音中かつトグルモードの場合は蓄積バッファにも追加
+        if is_recording && matches!(config.recording_mode, RecordingMode::Toggle { .. }) {
+            if has_voice {
+                let mut accumulated = self.accumulated_samples.lock().map_err(|_| anyhow!("蓄積バッファロックエラー"))?;
+                for &sample in samples {
+                    accumulated.push(sample.to_float_sample());
+                }
+            }
+        }
+        
         // 音声アクティビティの状態更新
         if has_voice {
             *last_activity = Some(Instant::now());
         }
         
-        // RecordingModeがVoiceActivityの場合、無音検出で録音を停止
+        // 録音時間の確認（トグルモード以外で最大録音時間を超えたら送信）
+        if is_recording {
+            if let Some(start_time) = *recording_start {
+                if let Some(max_duration) = config.max_recording_duration_sec {
+                    let current_duration = Instant::now().duration_since(start_time);
+                    
+                    // トグルモード以外で、かつ最大録音時間を超えた場合
+                    if let RecordingMode::VoiceActivity { .. } | RecordingMode::PushToTalk { .. } = &config.recording_mode {
+                        if current_duration.as_secs() >= max_duration as u64 {
+                            debug!("最大録音時間に達しました（{} 秒）", max_duration);
+                            
+                            // バッファを送信
+                            let samples: Vec<f32> = buffer.iter().copied().collect();
+                            if !samples.is_empty() {
+                                // 非同期チャネルへ送信
+                                let tx = self.tx.clone();
+                                let _ = tx.try_send(samples);
+                            }
+                            
+                            // 録音開始時間をリセット
+                            *recording_start = Some(Instant::now());
+                            
+                            // バッファをクリア
+                            buffer.clear();
+                            
+                            // トグルモード以外で録音継続中なら終了
+                            if let RecordingMode::VoiceActivity { .. } = &config.recording_mode {
+                                // 無音状態なら録音停止
+                                if !has_voice {
+                                    self.stop_recording()?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // RecordingModeがVoiceActivityの場合のみ、無音検出で録音を停止
         if let RecordingMode::VoiceActivity { .. } = &config.recording_mode {
             if is_recording {
                 // 無音が一定時間続いたら録音を停止
@@ -89,6 +145,12 @@ impl AudioBuffer {
                 // 音声を検出したら録音を開始
                 self.start_recording()?;
             }
+        } else if let RecordingMode::Toggle { .. } = &config.recording_mode {
+            // トグルモードでは無音検出しても録音を継続
+            if is_recording && has_voice {
+                // 音声アクティビティを記録（デバッグ目的）
+                debug!("トグルモード: 音声アクティビティを検出");
+            }
         }
         
         Ok(())
@@ -98,18 +160,24 @@ impl AudioBuffer {
     pub fn start_recording(&self) -> Result<()> {
         if !self.is_recording.load(Ordering::SeqCst) {
             info!("録音を開始します");
+            // 通知を表示
+            let _ = show_notification("音声入力", "録音を開始しました");
+            
+            // 録音開始時間を設定
+            let mut recording_start = self.recording_start_time.lock().map_err(|_| anyhow!("録音時間ロックエラー"))?;
+            *recording_start = Some(Instant::now());
+            
+            // バッファをクリア（録音開始時に空の状態から始める）
+            let mut buffer = self.buffer.lock().map_err(|_| anyhow!("バッファロックエラー"))?;
+            buffer.clear();
+            
+            // 蓄積バッファをクリア
+            let mut accumulated = self.accumulated_samples.lock().map_err(|_| anyhow!("蓄積バッファロックエラー"))?;
+            accumulated.clear();
+            
             self.is_recording.store(true, Ordering::SeqCst);
             
-            // バッファの内容をコピーして送信
-            let buffer = self.buffer.lock().map_err(|_| anyhow!("バッファロックエラー"))?;
-            let samples: Vec<f32> = buffer.iter().copied().collect();
-            
-            if !samples.is_empty() {
-                // 非同期チャネルへ送信（非同期ランタイム外からも安全に送信）
-                let tx = self.tx.clone();
-                // 送信エラーは無視（受信側が閉じている場合）
-                let _ = tx.try_send(samples);
-            }
+            // 録音開始時に送信しない（音声データを受信してから送信する）
         }
         Ok(())
     }
@@ -118,17 +186,35 @@ impl AudioBuffer {
     pub fn stop_recording(&self) -> Result<()> {
         if self.is_recording.load(Ordering::SeqCst) {
             info!("録音を停止します");
+            // 通知を表示
+            let _ = show_notification("音声入力", "録音を停止しました");
+            
+            // 録音開始時間をリセット
+            let mut recording_start = self.recording_start_time.lock().map_err(|_| anyhow!("録音時間ロックエラー"))?;
+            *recording_start = None;
+            
             self.is_recording.store(false, Ordering::SeqCst);
             
-            // バッファの内容をコピーして送信
-            let buffer = self.buffer.lock().map_err(|_| anyhow!("バッファロックエラー"))?;
-            let samples: Vec<f32> = buffer.iter().copied().collect();
-            
-            if !samples.is_empty() {
-                // 非同期チャネルへ送信（非同期ランタイム外からも安全に送信）
+            // トグルモードの場合は蓄積バッファを送信
+            let accumulated = self.accumulated_samples.lock().map_err(|_| anyhow!("蓄積バッファロックエラー"))?;
+            if !accumulated.is_empty() {
+                debug!("トグルモード: 蓄積バッファからサンプル送信 ({} サンプル)", accumulated.len());
+                // 非同期チャネルへ送信
                 let tx = self.tx.clone();
+                let samples = accumulated.clone();
                 // 送信エラーは無視（受信側が閉じている場合）
                 let _ = tx.try_send(samples);
+            } else {
+                // 蓄積バッファが空の場合は通常バッファから送信
+                let buffer = self.buffer.lock().map_err(|_| anyhow!("バッファロックエラー"))?;
+                let samples: Vec<f32> = buffer.iter().copied().collect();
+                
+                if !samples.is_empty() {
+                    // 非同期チャネルへ送信（非同期ランタイム外からも安全に送信）
+                    let tx = self.tx.clone();
+                    // 送信エラーは無視（受信側が閉じている場合）
+                    let _ = tx.try_send(samples);
+                }
             }
         }
         Ok(())
@@ -151,8 +237,13 @@ pub struct AudioCapture {
 impl AudioCapture {
     /// 新しいAudioCaptureを作成
     pub fn new(config: Config, tx: mpsc::Sender<Vec<f32>>) -> Self {
-        // リングバッファの容量を計算（デフォルトで5秒分）
-        let buffer_capacity = config.sample_rate as usize * config.channels as usize * 5;
+        // リングバッファの容量を計算
+        let buffer_capacity = match config.recording_mode {
+            // トグルモードではより大きなバッファ容量を確保（5分相当）
+            RecordingMode::Toggle { .. } => config.sample_rate as usize * config.channels as usize * 300,
+            // その他のモードは従来通り5秒分
+            _ => config.sample_rate as usize * config.channels as usize * 5,
+        };
         
         Self {
             config,
@@ -275,52 +366,29 @@ impl AudioCapture {
 
     /// トグルモードの制御を設定
     pub fn setup_toggle_control(&mut self) -> Result<()> {
-        if let RecordingMode::Toggle { start_key, stop_key } = &self.config.recording_mode.clone() {
-            info!("トグル開始キー: {}", start_key);
-            if let Some(stop) = stop_key {
-                info!("トグル停止キー: {}", stop);
-            } else {
-                info!("トグル停止キー: 同じ ({}, トグル動作)", start_key);
-            }
+        if let RecordingMode::Toggle { key } = &self.config.recording_mode.clone() {
+            info!("トグルキー: {}", key);
             
             // キー名を設定
-            let toggle_start_key = parse_key_name(start_key);
-            let toggle_stop_key = stop_key.as_ref().map(|k| parse_key_name(k)).unwrap_or(toggle_start_key);
+            let toggle_key = parse_key_name(key);
             let audio_buffer = self.audio_buffer.clone();
-            let is_single_key = stop_key.is_none();
             
             // キー入力監視スレッドを作成
             let handle = thread::spawn(move || {
                 let callback = move |event: Event| {
                     match event.event_type {
                         EventType::KeyPress(key_event) => {
-                            if key_event == toggle_start_key {
-                                debug!("トグル開始キー押下: {:?}", key_event);
-                                if is_single_key {
-                                    // 単一キーの場合は状態をトグル
-                                    if audio_buffer.is_recording() {
-                                        if let Err(e) = audio_buffer.stop_recording() {
-                                            error!("録音停止エラー: {}", e);
-                                        }
-                                    } else {
-                                        if let Err(e) = audio_buffer.start_recording() {
-                                            error!("録音開始エラー: {}", e);
-                                        }
-                                    }
-                                } else {
-                                    // 開始キーと停止キーが別の場合
-                                    if !audio_buffer.is_recording() {
-                                        if let Err(e) = audio_buffer.start_recording() {
-                                            error!("録音開始エラー: {}", e);
-                                        }
-                                    }
-                                }
-                            } else if key_event == toggle_stop_key && !is_single_key {
-                                // 開始キーと停止キーが別の場合
-                                debug!("トグル停止キー押下: {:?}", key_event);
+                            if key_event == toggle_key {
+                                debug!("トグルキー押下: {:?}", key_event);
+                                
+                                // 状態をトグル
                                 if audio_buffer.is_recording() {
                                     if let Err(e) = audio_buffer.stop_recording() {
                                         error!("録音停止エラー: {}", e);
+                                    }
+                                } else {
+                                    if let Err(e) = audio_buffer.start_recording() {
+                                        error!("録音開始エラー: {}", e);
                                     }
                                 }
                             }
@@ -401,4 +469,44 @@ fn parse_key_name(key_name: &str) -> Key {
             Key::CapsLock
         }
     }
+}
+
+/// デスクトップ通知を表示
+pub fn show_notification(title: &str, message: &str) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        // LinuxではnotifySendを使用
+        if let Ok(status) = Command::new("which")
+            .arg("notify-send")
+            .output()
+        {
+            if status.status.success() {
+                let _ = Command::new("notify-send")
+                    .arg(title)
+                    .arg(message)
+                    .spawn();
+                return Ok(());
+            }
+        }
+    }
+    
+    #[cfg(target_os = "macos")]
+    {
+        // macOSではosascriptを使用
+        let script = format!(
+            "display notification \"{}\" with title \"{}\"",
+            message.replace("\"", "\\\""),
+            title.replace("\"", "\\\"")
+        );
+        
+        let _ = Command::new("osascript")
+            .args(["-e", &script])
+            .spawn();
+        
+        return Ok(());
+    }
+    
+    // 対応プラットフォームがない場合や通知コマンドがない場合は警告だけ出して続行
+    warn!("通知機能を利用できません");
+    Ok(())
 } 

@@ -11,6 +11,7 @@ use tokio::time::sleep;
 
 use crate::config::{Config, OutputMode};
 use crate::transcriber::TranscriptionResult;
+use crate::audio::show_notification;
 
 /// 出力マネージャー
 pub struct OutputManager {
@@ -64,6 +65,16 @@ impl OutputManager {
             .map_err(|e| anyhow!("クリップボードコピーエラー: {}", e))?;
         
         info!("クリップボードにコピーしました ({} 文字)", text.len());
+        
+        // 通知を表示
+        let short_text = if text.len() > 30 {
+            format!("{}...", &text[..30])
+        } else {
+            text.to_string()
+        };
+        let message = format!("クリップボードにコピーしました：{}", short_text);
+        let _ = show_notification("音声入力", &message);
+        
         Ok(())
     }
 

@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
             whisper_cpp_model 
         } => {
             // 設定の読み込み
-            let config = Config::new(
+            let mut config = Config::new(
                 &mode,
                 &lang,
                 ptt.as_deref(),
@@ -104,6 +104,11 @@ async fn main() -> Result<()> {
                 whisper_cpp_path.as_ref(),
                 whisper_cpp_model.as_ref(),
             )?;
+            
+            // トグルモードの場合、録音の最大持続時間を長く設定
+            if let config::RecordingMode::Toggle { .. } = config.recording_mode {
+                config.max_recording_duration_sec = Some(300); // 5分
+            }
             
             info!("音声認識を開始します: モード={}, 言語={}, エンジン={}", mode, lang, engine);
             

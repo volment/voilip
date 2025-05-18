@@ -74,8 +74,7 @@ pub enum RecordingMode {
     },
     /// トグル開始/停止
     Toggle {
-        start_key: String,
-        stop_key: Option<String>,
+        key: String,
     },
 }
 
@@ -134,11 +133,16 @@ impl Config {
             config.recording_mode = RecordingMode::PushToTalk {
                 key: key.to_string(),
             };
-        } else if let Ok(start_key) = env::var("TOGGLE_START_KEY") {
-            let stop_key = env::var("TOGGLE_STOP_KEY").ok();
+        } else if let Ok(toggle_key) = env::var("TOGGLE_KEY") {
+            // TOGGLE_KEYを使用
             config.recording_mode = RecordingMode::Toggle {
-                start_key,
-                stop_key,
+                key: toggle_key,
+            };
+        } else if let Ok(start_key) = env::var("TOGGLE_START_KEY") {
+            // 後方互換性のために古い環境変数もサポート
+            warn!("TOGGLE_START_KEY/TOGGLE_STOP_KEYは非推奨です。代わりにTOGGLE_KEYを使用してください。");
+            config.recording_mode = RecordingMode::Toggle {
+                key: start_key,
             };
         }
         
