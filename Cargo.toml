@@ -1,0 +1,46 @@
+[package]
+name = "voilip"
+version = "0.1.0"
+edition = "2021"
+description = "CLI音声入力ユーティリティ - マイク入力をリアルタイムで文字起こしし、クリップボードや入力としてペースト"
+authors = ["volment"]
+license = "MIT"
+
+[dependencies]
+# CLI引数解析
+clap = { version = "4.4", features = ["derive"] }
+# 環境変数
+dotenv = "0.15"
+# ログ
+tracing = "0.1"
+tracing-subscriber = "0.3"
+# 非同期処理
+tokio = { version = "1.35", features = ["full"] }
+# エラーハンドリング
+anyhow = "1.0"
+thiserror = "1.0"
+# 音声処理
+cpal = { version = "0.15", default-features = false }
+hound = "3.5"
+dasp = { version = "0.11", features = ["signal", "interpolate", "ring_buffer"] }
+# OpenAI API
+ureq = { version = "1.5.4", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# クリップボード操作 (ICU依存を避けるためarboardからclipboardに変更)
+arboard = { version = "3.2", features = ["wayland-data-control"] }
+# キー入力
+rdev = "0.5"
+# Whisper.cpp FFI (オプション)
+whisper-rs = { version = "0.10", optional = true }
+# 一時ファイル
+tempfile = "3.9"
+
+[features]
+default = ["audio_backend"]
+audio_backend = []
+whisper-cpp = ["whisper-rs"]
+
+[profile.release]
+lto = true
+codegen-units = 1
